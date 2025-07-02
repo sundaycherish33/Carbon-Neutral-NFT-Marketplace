@@ -7,6 +7,13 @@
 (define-constant err-invalid-price (err u105))
 (define-constant err-self-transfer (err u106))
 (define-constant err-insufficient-funds (err u107))
+(define-constant min-stake-amount u100)
+(define-constant stake-lock-period u144)
+(define-constant base-reward-rate u5)
+
+(define-data-var total-staked-credits uint u0)
+(define-data-var reward-pool uint u0)
+(define-data-var next-stake-id uint u1)
 
 (define-data-var next-nft-id uint u1)
 (define-data-var carbon-offset-rate uint u10)
@@ -245,4 +252,97 @@
     nft (some (get carbon-footprint nft))
     none
   )
+)
+
+
+
+(define-map stakes
+  uint
+  {
+    staker: principal,
+    amount: uint,
+    start-block: uint,
+    reward-rate: uint,
+    active: bool
+  }
+)
+
+(define-map user-stakes
+  principal
+  (list 10 uint)
+)
+
+(define-public (stake-carbon-credits (amount uint))
+  (let
+    (
+      (stake-id (var-get next-stake-id))
+      (user-credits (get-user-carbon-credits tx-sender))
+      (current-stakes (default-to (list) (map-get? user-stakes tx-sender)))
+    )
+    (asserts! (>= amount min-stake-amount) err-invalid-price)
+    (asserts! (>= user-credits amount) err-insufficient-offset)
+    (map-set user-carbon-credits tx-sender (- user-credits amount))
+    (map-set stakes stake-id
+      {
+        staker: tx-sender,
+        amount: amount,
+        start-block: stacks-block-height,
+        reward-rate: base-reward-rate,
+        active: true
+      }
+    )
+    (map-set user-stakes tx-sender (unwrap! (as-max-len? (append current-stakes stake-id) u10) err-already-exists))
+    (var-set next-stake-id (+ stake-id u1))
+    (var-set total-staked-credits (+ (var-get total-staked-credits) amount))
+    (ok stake-id)
+  )
+)
+
+(define-public (unstake-carbon-credits (stake-id uint))
+  (let
+    (
+      (stake-info (unwrap! (map-get? stakes stake-id) err-not-found))
+      (blocks-staked (- stacks-block-height (get start-block stake-info)))
+      (rewards (calculate-staking-rewards stake-id))
+    )
+    (asserts! (is-eq (get staker stake-info) tx-sender) err-unauthorized)
+    (asserts! (get active stake-info) err-not-found)
+    (asserts! (>= blocks-staked stake-lock-period) err-unauthorized)
+    (let
+      (
+        (total-return (+ (get amount stake-info) rewards))
+        (current-credits (get-user-carbon-credits tx-sender))
+      )
+      (map-set user-carbon-credits tx-sender (+ current-credits total-return))
+      (map-set stakes stake-id (merge stake-info { active: false }))
+      (var-set total-staked-credits (- (var-get total-staked-credits) (get amount stake-info)))
+      (ok total-return)
+    )
+  )
+)
+
+(define-read-only (calculate-staking-rewards (stake-id uint))
+  (match (map-get? stakes stake-id)
+    stake-info
+      (let
+        (
+          (blocks-staked (- stacks-block-height (get start-block stake-info)))
+          (reward-multiplier (/ (* blocks-staked (get reward-rate stake-info)) u10000))
+        )
+        (/ (* (get amount stake-info) reward-multiplier) u100)
+      )
+    u0
+  )
+)
+
+(define-read-only (get-stake-info (stake-id uint))
+  (map-get? stakes stake-id)
+)
+
+(define-read-only (get-user-stakes (user principal))
+  (default-to (list) (map-get? user-stakes user))
+)
+
+(define-read-only (get-total-staked-credits)
+  (var-get total-staked-credits)
 )
