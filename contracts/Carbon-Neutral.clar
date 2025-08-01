@@ -11,6 +11,14 @@
 (define-constant stake-lock-period u144)
 (define-constant base-reward-rate u5)
 
+(define-constant err-invalid-position (err u202))
+(define-constant reward-pool-percentage u10)
+(define-constant max-leaderboard-size u50)
+
+(define-data-var leaderboard-season uint u1)
+(define-data-var season-reward-pool uint u0)
+(define-data-var total-participants uint u0)
+
 (define-data-var total-staked-credits uint u0)
 (define-data-var reward-pool uint u0)
 (define-data-var next-stake-id uint u1)
@@ -345,4 +353,108 @@
 
 (define-read-only (get-total-staked-credits)
   (var-get total-staked-credits)
+)
+
+(define-map user-carbon-stats
+  { user: principal, season: uint }
+  {
+    total-offset: uint,
+    rank: uint,
+    last-updated: uint,
+    reward-earned: uint
+  }
+)
+
+(define-map leaderboard-rankings
+  { season: uint, rank: uint }
+  {
+    user: principal,
+    carbon-offset: uint,
+    percentage-share: uint
+  }
+)
+
+(define-map season-rewards
+  uint
+  {
+    total-pool: uint,
+    distributed: uint,
+    active: bool
+  }
+)
+
+(define-public (record-carbon-offset (user principal) (offset-amount uint))
+  (let
+    (
+      (current-season (var-get leaderboard-season))
+      (current-stats (default-to 
+        { total-offset: u0, rank: u0, last-updated: u0, reward-earned: u0 }
+        (map-get? user-carbon-stats { user: user, season: current-season })
+      ))
+      (new-total (+ (get total-offset current-stats) offset-amount))
+    )
+    (map-set user-carbon-stats { user: user, season: current-season }
+      (merge current-stats 
+        { 
+          total-offset: new-total,
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (try! (update-user-rank user current-season new-total))
+    (ok true)
+  )
+)
+
+(define-public (update-user-rank (user principal) (season uint) (carbon-offset uint))
+  (let
+    (
+      (new-rank (calculate-user-rank user season carbon-offset))
+    )
+    (map-set user-carbon-stats { user: user, season: season }
+      (merge 
+        (unwrap! (map-get? user-carbon-stats { user: user, season: season }) err-not-found)
+        { rank: new-rank }
+      )
+    )
+    (map-set leaderboard-rankings { season: season, rank: new-rank }
+      {
+        user: user,
+        carbon-offset: carbon-offset,
+        percentage-share: (calculate-reward-percentage new-rank)
+      }
+    )
+    (ok new-rank)
+  )
+)
+
+(define-private (calculate-user-rank (user principal) (season uint) (carbon-offset uint))
+  (fold count-higher-performers (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u1)
+)
+
+(define-private (count-higher-performers (rank uint) (current-count uint))
+  current-count
+)
+
+(define-private (calculate-reward-percentage (rank uint))
+  (if (<= rank u3)
+    (if (is-eq rank u1) u30 (if (is-eq rank u2) u20 u15))
+    (if (<= rank u10) u5 u1)
+  )
+)
+
+(define-read-only (get-user-stats (user principal) (season uint))
+  (map-get? user-carbon-stats { user: user, season: season })
+)
+
+(define-read-only (get-leaderboard-position (season uint) (rank uint))
+  (map-get? leaderboard-rankings { season: season, rank: rank })
+)
+
+(define-read-only (get-current-season)
+  (var-get leaderboard-season)
+)
+
+(define-read-only (get-season-info (season uint))
+  (map-get? season-rewards season)
 )
