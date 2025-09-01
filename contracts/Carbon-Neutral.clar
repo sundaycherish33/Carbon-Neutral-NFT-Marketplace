@@ -28,6 +28,14 @@
 (define-data-var total-carbon-offset uint u0)
 (define-data-var marketplace-fee uint u250)
 
+(define-constant err-invalid-verification (err u301))
+(define-constant err-verification-exists (err u302))
+(define-constant err-audit-unauthorized (err u303))
+(define-constant min-reputation-score u50)
+
+(define-data-var next-verification-id uint u1)
+(define-data-var verification-fee uint u100000)
+
 (define-map nfts
   uint
   {
@@ -457,4 +465,132 @@
 
 (define-read-only (get-season-info (season uint))
   (map-get? season-rewards season)
+)
+
+
+(define-map verification-requests
+  uint
+  {
+    provider: principal,
+    offset-amount: uint,
+    proof-hash: (string-ascii 64),
+    status: (string-ascii 16),
+    submitted-at: uint,
+    verified-at: uint,
+    verifier: (optional principal)
+  }
+)
+
+(define-map provider-reputation
+  principal
+  {
+    total-verified: uint,
+    total-rejected: uint,
+    reputation-score: uint,
+    last-audit: uint
+  }
+)
+
+(define-map audit-trail
+  { provider: principal, verification-id: uint }
+  {
+    offset-claimed: uint,
+    verified-amount: uint,
+    verification-date: uint,
+    auditor-notes: (string-ascii 128)
+  }
+)
+
+(define-public (submit-verification (offset-amount uint) (proof-hash (string-ascii 64)))
+  (let
+    (
+      (verification-id (var-get next-verification-id))
+      (fee (var-get verification-fee))
+    )
+    (try! (stx-transfer? fee tx-sender contract-owner))
+    (map-set verification-requests verification-id
+      {
+        provider: tx-sender,
+        offset-amount: offset-amount,
+        proof-hash: proof-hash,
+        status: "pending",
+        submitted-at: stacks-block-height,
+        verified-at: u0,
+        verifier: none
+      }
+    )
+    (var-set next-verification-id (+ verification-id u1))
+    (ok verification-id)
+  )
+)
+
+(define-public (approve-verification (verification-id uint) (verified-amount uint))
+  (let
+    (
+      (request (unwrap! (map-get? verification-requests verification-id) err-not-found))
+      (provider (get provider request))
+      (current-rep (default-to 
+        { total-verified: u0, total-rejected: u0, reputation-score: u100, last-audit: u0 }
+        (map-get? provider-reputation provider)
+      ))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get status request) "pending") err-invalid-verification)
+    (map-set verification-requests verification-id
+      (merge request 
+        { status: "approved", verified-at: stacks-block-height, verifier: (some tx-sender) }
+      )
+    )
+    (map-set provider-reputation provider
+      (merge current-rep
+        {
+          total-verified: (+ (get total-verified current-rep) u1),
+          reputation-score: (calculate-reputation-score provider u1 u0),
+          last-audit: stacks-block-height
+        }
+      )
+    )
+    (map-set audit-trail { provider: provider, verification-id: verification-id }
+      {
+        offset-claimed: (get offset-amount request),
+        verified-amount: verified-amount,
+        verification-date: stacks-block-height,
+        auditor-notes: "approved-verification"
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-reputation-score (provider principal) (approved uint) (rejected uint))
+  (let
+    (
+      (current-rep (default-to 
+        { total-verified: u0, total-rejected: u0, reputation-score: u100, last-audit: u0 }
+        (map-get? provider-reputation provider)
+      ))
+      (total-verified (+ (get total-verified current-rep) approved))
+      (total-rejected (+ (get total-rejected current-rep) rejected))
+      (total-requests (+ total-verified total-rejected))
+    )
+    (if (> total-requests u0)
+      (/ (* total-verified u100) total-requests)
+      u100
+    )
+  )
+)
+
+(define-read-only (get-verification-request (verification-id uint))
+  (map-get? verification-requests verification-id)
+)
+
+(define-read-only (get-provider-reputation (provider principal))
+  (map-get? provider-reputation provider)
+)
+
+(define-read-only (is-provider-verified (provider principal))
+  (match (map-get? provider-reputation provider)
+    rep (>= (get reputation-score rep) min-reputation-score)
+    false
+  )
 )
