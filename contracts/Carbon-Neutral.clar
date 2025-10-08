@@ -15,6 +15,10 @@
 (define-constant reward-pool-percentage u10)
 (define-constant max-leaderboard-size u50)
 
+(define-constant err-batch-limit (err u400))
+(define-constant err-batch-empty (err u401))
+(define-constant max-batch-size u10)
+
 (define-data-var leaderboard-season uint u1)
 (define-data-var season-reward-pool uint u0)
 (define-data-var total-participants uint u0)
@@ -593,4 +597,110 @@
     rep (>= (get reputation-score rep) min-reputation-score)
     false
   )
+)
+
+
+(define-map batch-operations
+  uint
+  {
+    initiator: principal,
+    operation-type: (string-ascii 16),
+    nft-count: uint,
+    total-carbon-offset: uint,
+    executed-at: uint
+  }
+)
+
+(define-data-var next-batch-id uint u1)
+
+(define-public (batch-mint-nfts (nft-data (list 10 {title: (string-ascii 64), description: (string-ascii 256), image-url: (string-ascii 256), carbon-footprint: uint})))
+  (let
+    (
+      (batch-id (var-get next-batch-id))
+      (nft-count (len nft-data))
+      (total-offset (fold sum-carbon-footprints nft-data u0))
+    )
+    (asserts! (> nft-count u0) err-batch-empty)
+    (asserts! (<= nft-count max-batch-size) err-batch-limit)
+    (try! (purchase-carbon-credits tx-sender total-offset))
+    (map-set batch-operations batch-id
+      {
+        initiator: tx-sender,
+        operation-type: "batch-mint",
+        nft-count: nft-count,
+        total-carbon-offset: total-offset,
+        executed-at: stacks-block-height
+      }
+    )
+    (var-set next-batch-id (+ batch-id u1))
+    (ok (map mint-single-nft nft-data))
+  )
+)
+
+(define-public (batch-list-nfts (nft-listings (list 10 {nft-id: uint, price: uint})))
+  (let
+    (
+      (listing-count (len nft-listings))
+    )
+    (asserts! (> listing-count u0) err-batch-empty)
+    (asserts! (<= listing-count max-batch-size) err-batch-limit)
+    (ok (map list-single-nft nft-listings))
+  )
+)
+
+(define-private (mint-single-nft (nft-info {title: (string-ascii 64), description: (string-ascii 256), image-url: (string-ascii 256), carbon-footprint: uint}))
+  (let
+    (
+      (nft-id (var-get next-nft-id))
+    )
+    (map-set nfts nft-id
+      {
+        owner: tx-sender,
+        title: (get title nft-info),
+        description: (get description nft-info),
+        image-url: (get image-url nft-info),
+        carbon-footprint: (get carbon-footprint nft-info),
+        created-at: stacks-block-height
+      }
+    )
+    (var-set next-nft-id (+ nft-id u1))
+    nft-id
+  )
+)
+
+(define-private (list-single-nft (listing-info {nft-id: uint, price: uint}))
+  (match (map-get? nfts (get nft-id listing-info))
+    nft
+      (if (is-eq (get owner nft) tx-sender)
+        (begin
+          (map-set listings (get nft-id listing-info)
+            {
+              seller: tx-sender,
+              price: (get price listing-info),
+              carbon-offset-required: (* (get carbon-footprint nft) (var-get carbon-offset-rate)),
+              active: true
+            }
+          )
+          true
+        )
+        false
+      )
+    false
+  )
+)
+
+(define-private (sum-carbon-footprints (nft-info {title: (string-ascii 64), description: (string-ascii 256), image-url: (string-ascii 256), carbon-footprint: uint}) (accumulator uint))
+  (+ accumulator (* (get carbon-footprint nft-info) (var-get carbon-offset-rate)))
+)
+
+(define-read-only (get-batch-operation (batch-id uint))
+  (map-get? batch-operations batch-id)
+)
+
+(define-read-only (calculate-batch-carbon-cost (carbon-footprints (list 10 uint)))
+  (fold add-footprint carbon-footprints u0)
+)
+
+(define-private (add-footprint (footprint uint) (total uint))
+  (+ total (* footprint (var-get carbon-offset-rate)))
 )
