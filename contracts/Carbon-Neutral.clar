@@ -129,22 +129,21 @@
       (price (get price listing))
       (carbon-offset-required (get carbon-offset-required listing))
       (marketplace-fee-amount (/ (* price (var-get marketplace-fee)) u10000))
-      (seller-amount (- price marketplace-fee-amount))
+      (royalty-result (unwrap-panic (process-royalty-payment nft-id price tx-sender seller)))
+      (net-to-seller (- (- price marketplace-fee-amount) royalty-result))
     )
     (asserts! (get active listing) err-not-found)
     (asserts! (not (is-eq tx-sender seller)) err-self-transfer)
-    (try! (stx-transfer? price tx-sender seller))
+    (try! (stx-transfer? net-to-seller tx-sender seller))
+    (try! (stx-transfer? marketplace-fee-amount tx-sender contract-owner))
     (try! (purchase-carbon-credits tx-sender carbon-offset-required))
-    (map-set nfts nft-id
-      (merge nft { owner: tx-sender })
-    )
-    (map-set listings nft-id
-      (merge listing { active: false })
-    )
+    (map-set nfts nft-id (merge nft { owner: tx-sender }))
+    (map-set listings nft-id (merge listing { active: false }))
     (var-set total-carbon-offset (+ (var-get total-carbon-offset) carbon-offset-required))
     (ok true)
   )
 )
+
 
 (define-public (purchase-carbon-credits (buyer principal) (amount uint))
   (let
@@ -703,4 +702,84 @@
 
 (define-private (add-footprint (footprint uint) (total uint))
   (+ total (* footprint (var-get carbon-offset-rate)))
+)
+
+(define-map nft-royalties
+  uint
+  {
+    creator: principal,
+    royalty-percentage: uint,
+    carbon-reinvest-percentage: uint,
+    total-earned: uint
+  }
+)
+
+(define-constant max-royalty-percentage u1000)
+(define-constant err-invalid-royalty (err u108))
+
+(define-public (set-nft-royalty (nft-id uint) (royalty-percentage uint) (carbon-reinvest-percentage uint))
+  (let
+    (
+      (nft (unwrap! (map-get? nfts nft-id) err-not-found))
+    )
+    (asserts! (is-eq (get owner nft) tx-sender) err-unauthorized)
+    (asserts! (<= royalty-percentage max-royalty-percentage) err-invalid-royalty)
+    (asserts! (<= carbon-reinvest-percentage u100) err-invalid-royalty)
+    (map-set nft-royalties nft-id
+      {
+        creator: tx-sender,
+        royalty-percentage: royalty-percentage,
+        carbon-reinvest-percentage: carbon-reinvest-percentage,
+        total-earned: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (process-royalty-payment (nft-id uint) (sale-price uint) (buyer principal) (seller principal))
+  (match (map-get? nft-royalties nft-id)
+    royalty-info
+      (let
+        (
+          (royalty-amount (/ (* sale-price (get royalty-percentage royalty-info)) u10000))
+          (carbon-portion (/ (* royalty-amount (get carbon-reinvest-percentage royalty-info)) u100))
+          (creator-portion (- royalty-amount carbon-portion))
+          (creator (get creator royalty-info))
+        )
+        (if (and (> royalty-amount u0) (not (is-eq seller creator)))
+          (begin
+            (try! (stx-transfer? creator-portion seller creator))
+            (if (> carbon-portion u0)
+              (try! (purchase-carbon-credits creator (/ carbon-portion u1000000)))
+              true
+            )
+            (map-set nft-royalties nft-id
+              (merge royalty-info { total-earned: (+ (get total-earned royalty-info) royalty-amount) })
+            )
+            (ok royalty-amount)
+          )
+          (ok u0)
+        )
+      )
+    (ok u0)
+  )
+)
+
+(define-read-only (get-nft-royalty (nft-id uint))
+  (map-get? nft-royalties nft-id)
+)
+
+(define-read-only (calculate-royalty-split (nft-id uint) (sale-price uint))
+  (match (map-get? nft-royalties nft-id)
+    royalty-info
+      (let
+        (
+          (royalty-amount (/ (* sale-price (get royalty-percentage royalty-info)) u10000))
+          (carbon-portion (/ (* royalty-amount (get carbon-reinvest-percentage royalty-info)) u100))
+        )
+        (some { total-royalty: royalty-amount, creator-gets: (- royalty-amount carbon-portion), carbon-reinvest: carbon-portion })
+      )
+    none
+  )
 )
